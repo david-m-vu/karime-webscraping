@@ -1,27 +1,6 @@
-/**
- * Import function triggers from their respective submodules:
- *
- * const {onCall} = require("firebase-functions/v2/https");
- * const {onDocumentWritten} = require("firebase-functions/v2/firestore");
- *
- * See a full list of supported triggers at https://firebase.google.com/docs/functions
- */
+const {onRequest} = require("firebase-functions/v2/https");
 
-// const {onRequest} = require("firebase-functions/v2/https");
-// const logger = require("firebase-functions/logger");
-
-// Create and deploy your first functions
-// https://firebase.google.com/docs/functions/get-started
-
-// exports.helloWorld = onRequest((request, response) => {
-//   logger.info("Hello logs!", {structuredData: true});
-//   response.send("Hello from Firebase!");
-// });
-
-const functions = require("firebase-functions");
-
-
-const cors = require("cors")({ origin: true })
+// const cors = require("cors")({ origin: true })
 
 const cheerio = require("cheerio");
 const axios = require("axios");
@@ -56,7 +35,7 @@ const getKPOPPictures = async (idolName) => {
     });
     
     // get all images from each album;
-    const fetchAlbumsWithDelay = async (albumURLs) => {
+    const fetchAlbums = async (albumURLs) => {
         const albums = [];
         for (let i = 0; i < albumURLs.length; i++) {
             const url = albumURLs[i];
@@ -68,12 +47,15 @@ const getKPOPPictures = async (idolName) => {
 
             let pictureURLs = [];
             $(".justified-gallery a").each((index, element) => {
-                pictureURLs.push(`${kpoppingBaseURL}${$(element).attr('href')}`);
+                pictureURLs.push({
+                    thumbnailUrl: `${kpoppingBaseURL}${$(element).attr('href')}`,
+                    imageUrl: `${kpoppingBaseURL}${$(element).attr('href')}`,
+                });
             });
 
             const title = $(`meta[property="og:title"]`).attr('content')
 
-            console.log(`${i}: ${url}, ${title}, ${pictureURLs}`)
+            // console.log(`${i}: ${url}, ${title}, ${pictureURLs}`)
 
             albums.push({ url, title, pictureURLs })
         }
@@ -81,7 +63,7 @@ const getKPOPPictures = async (idolName) => {
         return albums;
     }
 
-    const albumsToReturn = await fetchAlbumsWithDelay(albumURLs);
+    const albumsToReturn = await fetchAlbums(albumURLs);
 
     return {
         idolName,
@@ -90,18 +72,32 @@ const getKPOPPictures = async (idolName) => {
     }
 }
 
-exports.scraper = functions.https.onRequest((request, response) => {
-    cors(request, response, async () => {
-        const body = request.body;
+exports.scraper = onRequest((request, response) => {
+    response.set('Access-Control-Allow-Origin', '*');
+    response.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    response.set('Access-Control-Allow-Headers', 'Content-Type');
 
-        if (Object.keys(body).length === 0) response.send("Hi")
+    if (request.method === 'OPTIONS') {
+        response.status(204).send('');
+        return;
+    }
 
-        const data = await getKPOPPictures(body.idolName)
+    const body = request.body;
 
-        if (data) {
-            response.send(data);
-        } else {
-            response.send("Idol doesn't exist")
-        }
-    })
-})
+    if (!body || Object.keys(body).length === 0) {
+        response.send("Hi");
+        return;
+    }
+
+    getKPOPPictures(body.idolName)
+        .then((data) => {
+            if (data) {
+                response.send(data);
+            } else {
+                response.send("Idol doesn't exist");
+            }
+        })
+        .catch((error) => {
+            response.status(500).send(error.message);
+        });
+});
