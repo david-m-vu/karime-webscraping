@@ -218,10 +218,14 @@ const getKpopPicturesV2 = async (idolName) => {
         
     } catch (err) {
         console.log("Error: ", err.message);
+        throw new Error(err.message);
     }
 }
 
-exports.getKpopPicturesV2 = onRequest((request, response) => {
+exports.getKpopPicturesV2 = onRequest({
+    timeoutSeconds: 540,
+    memory: "1GiB",
+}, (request, response) => {
     response.set('Access-Control-Allow-Origin', '*');
     response.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     response.set('Access-Control-Allow-Headers', 'Content-Type');
