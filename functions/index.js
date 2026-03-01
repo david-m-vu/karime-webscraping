@@ -1,42 +1,10 @@
+const { getWithRetry, extractIdolId } = require("./util")
+
 const { onRequest } = require("firebase-functions/v2/https");
-
-// const cors = require("cors")({ origin: true })
-
 const cheerio = require("cheerio");
-const axios = require("axios");
-const https = require("https");
+const puppeteer = require("puppeteer");
 
 const kpoppingBaseURL = "https://kpopping.com"
-
-// use keepAlive: true to let multiple requests reuse the same TCP/TLS connection, lowering chances of CDN returning 425 Too Early error
-const httpAgent = new https.Agent({ keepAlive: true }); 
-
-// resolve promise after given ms
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-/*
- * Must include User-Agent in headers because the CDN (or Web Application Firewall WAF) for kpopping likely blocks suspicious requests that
- * don't come from legitimate users, therefore returning the 403 Forbidden status code.
- * Kpopping uses a configured cloudfront CDN (which enforces rate limits, TLS/0-RTT, and cache lifetime)
- * to forward certain headers to their backend, which they end up checking
- */ 
-const client = axios.create({
-  timeout: 15000, // abort the request if no response completes with 15s
-  httpsAgent: httpAgent,
-  headers: {
-    "User-Agent":
-      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Accept":
-      "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
-    "Referer": "https://kpopping.com/",
-    "Upgrade-Insecure-Requests": "1", // "I prefer HTTPS versions", make header set look more browser-like
-  },
-});
-
 
 // Example response:
 // {
@@ -68,8 +36,7 @@ const client = axios.create({
 //      ]
 //  }
  
-
-const getKPOPPictures = async (idolName) => {
+const getKpopPicturesV1 = async (idolName) => {
     try {
         // use encodeURIComponent to encode a text string as a valid component of a Uniform Resource Identifier (URI).'
         // ex: kim chaewon turns into kim%20chaewon
@@ -140,39 +107,151 @@ const getKPOPPictures = async (idolName) => {
     }
 }
 
-/*
- * This function is necessary due to the 425: Too Early status code. This is because of RTT-0
- * where new connections can skip the TLS handshake and move straight to sending the HTTP requests
- * without verifications. It's not guaranteed that every request goes over the same established TLS session,
- * so when we send a bunch of requests at the same time, it might act as a red flag to the CDN when
- * we're making multiple TLS connections
- */
-const getWithRetry = async (url, tries = 3) => {
-    let lastErr;
-    for (let i = 0; i < tries; i++) {
-        try {
-            // set the referer to the page we're fetching from so it looks more natural
-            return await client.get(url, { headers: { Referer: url }});
-        } catch (err) {
-            const status = err.response?.status;
-            lastErr = err;
+const getKpopPicturesV2 = async (idolName) => {
+    try {
+        const initialURL = `https://kpopping.com/profiles/idol/${encodeURIComponent(idolName)}`;
 
-            // don't retry if status is not one of these 4 (transient statuses) or if we're on our last try
-            if (![425, 429, 503, 403].includes(status) || i === tries - 1) {
-                throw err;
+        const initialRes = await getWithRetry(initialURL);
+        const initialHTML = initialRes.data;
+
+        const $ = cheerio.load(initialHTML);
+
+        // , means match either selector
+        const groupAnchor = $('a[href^="/profiles/group/"], a[href*="https://kpopping.com/profiles/group/"]').first();
+        const groupName = (groupAnchor.length > 0) ? ((groupAnchor.text() || "").trim() || "N/A") : "N/A";
+
+        // get idol UUID to get the idol's image gallery URL
+        const idolUUID = extractIdolId(initialHTML);
+        console.log(idolUUID);
+        if (!idolUUID) {
+            throw new Error("Could not extract idol UUID from initial HTML");
+        }
+
+        const imageGalleryURL = `${kpoppingBaseURL}/kpics?idol=${idolUUID}&idolName=${encodeURIComponent(idolName)}`;
+
+        // puppeteer step
+        const browser = await puppeteer.launch({
+            headless: "new", // run chrome without visible UI using puppeteer's newer headless mode, true is legacy
+            args: ["--no-sandbox", "--disable-setuid-sandbox"], // disable Chrome sandbox and setuid sandbox fallback
+        })
+
+        try {
+            // open a blank page
+            const page = await browser.newPage();
+            // networkIdle2 waits until there are no more than 2 network connections for at least 500ms (implying that page is mostly loaded)
+            await page.goto(imageGalleryURL, { waitUntil: "networkidle2", timeout: 60000 });
+
+            const gridSelector = 'div[class*="grid-cols-3"][class*="md:grid-cols-4"][class*="gap-3"]';
+            // wait for any anchor tag that has an href attribute inside of grid selector, regardless of its value
+            await page.waitForSelector(`${gridSelector} a[href]`, {timeout: 30000 });
+
+            // $$eval returns all elements matching the selector and passes the resulting array as the first argument to the callback
+            const albumURLs = await page.$$eval(`${gridSelector} a[href]`, (anchors) => {
+                return anchors
+                    .map((a) => a.getAttribute("href"))
+                    .filter((href) => typeof href === "string" && href.length > 0)
+            })
+
+            // attach href to absolute URL just in case hrefs are relative
+            // (if href is relative, it combines with the base. if href is already absolute, it keeps it as-is)
+            const absoluteAlbumURLs = albumURLs.map((href) => new URL(href, kpoppingBaseURL).toString());
+            console.log(absoluteAlbumURLs);
+
+            const albumImageURLs = [];
+            const albumImageSelector = 'div.overflow-x-auto div.flex[style*="gap: 8px"] button img[src]';
+            const singleImageSelector = 'div.relative.w-full.cursor-pointer.group img[src]';
+
+            for (const albumURL of absoluteAlbumURLs) {
+                console.log(`fetching image URLs from ${albumURL}`)
+                await page.goto(albumURL, { waitUntil: "networkidle2", timeout: 60000 });
+
+                // get album title
+                const title = await page.$eval("article h1, h1", (elem) => elem.textContent.trim())
+
+                let imageURLs = [];
+
+                try {
+                    // Multi-image albums: image strip of button thumbnails.
+                    await page.waitForSelector(albumImageSelector, { timeout: 5000 });
+                    imageURLs = await page.$$eval(albumImageSelector, (images) => {
+                        const srcs = images
+                            .map((img) => img.getAttribute("src"))
+                            .filter((src) => typeof src === "string" && src.length > 0);
+
+                        return [...new Set(srcs)];
+                    });
+                } catch { // if the above times out (because this album only has one image)
+                    // Single-image albums: fallback to main displayed image.
+                    await page.waitForSelector(singleImageSelector, { timeout: 30000 });
+                    imageURLs = await page.$$eval(singleImageSelector, (images) => {
+                        const srcs = images
+                            .map((img) => img.getAttribute("src"))
+                            .filter((src) => typeof src === "string" && src.length > 0);
+
+                        return [...new Set(srcs)];
+                    });
+                }
+
+                // for backwards compatibility
+                const pictureURLs = imageURLs.map((imageURL) => {
+                    return {
+                        thumbnailUrl: imageURL
+                    }
+                })
+
+                albumImageURLs.push({
+                    url: albumURL,
+                    title,
+                    pictureURLs,
+                });
             }
 
-            // before retry, backoff with jitter (randomness to retry delays)
-            const delay = (15000) + Math.floor(Math.random() * 400);
-            console.warn(`GET ${url} failed with ${status}. Retrying in ${delay} ms...`);
-            await sleep(delay);
+            return {
+                idolName,
+                groupName,
+                albums: albumImageURLs,
+            };
+
+        } finally { // catch propogates to the caller, so caller handles it
+            await browser.close();
         }
+        
+    } catch (err) {
+        console.log("Error: ", err.message);
     }
-    // if we made it past the loop without returning the get response, error
-    throw lastErr;
 }
 
-exports.scraper = onRequest((request, response) => {
+exports.getKpopPicturesV2 = onRequest((request, response) => {
+    response.set('Access-Control-Allow-Origin', '*');
+    response.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    response.set('Access-Control-Allow-Headers', 'Content-Type');
+
+    // handle browser preflight request
+    if (request.method === 'OPTIONS') {
+        response.status(204).send('');
+        return;
+    }
+
+    const body = request.body;
+
+    if (!body || Object.keys(body).length === 0) {
+        response.send("Hi, request body empty");
+        return;
+    }
+
+    getKpopPicturesV2(body.idolName).then((data) => {
+        if (data) {
+            response.send(data);
+        } else {
+            response.send("Something went wrong")
+        }
+    }).catch((error) => {
+        response.status(500).send(error.message);
+    });
+
+});
+
+exports.getKpopPicturesV1 = onRequest((request, response) => {
     response.set('Access-Control-Allow-Origin', '*');
     response.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     response.set('Access-Control-Allow-Headers', 'Content-Type');
@@ -189,7 +268,7 @@ exports.scraper = onRequest((request, response) => {
         return;
     }
 
-    getKPOPPictures(body.idolName)
+    getKpopPicturesV1(body.idolName)
         .then((data) => {
             if (data) {
                 response.send(data);
