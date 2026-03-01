@@ -122,7 +122,7 @@ const getKpopPicturesV2 = async (idolName) => {
 
         // get idol UUID to get the idol's image gallery URL
         const idolUUID = extractIdolId(initialHTML);
-        console.log(idolUUID);
+        console.log("idolUUID:", idolUUID);
         if (!idolUUID) {
             throw new Error("Could not extract idol UUID from initial HTML");
         }
@@ -166,7 +166,8 @@ const getKpopPicturesV2 = async (idolName) => {
                 await page.goto(albumURL, { waitUntil: "networkidle2", timeout: 60000 });
 
                 // get album title
-                const title = await page.$eval("article h1, h1", (elem) => elem.textContent.trim())
+                await page.waitForSelector("article h1, h1", { timeout: 30000 });
+                const title = await page.$eval("article h1, h1", (elem) => elem.textContent.trim());
 
                 let imageURLs = [];
 

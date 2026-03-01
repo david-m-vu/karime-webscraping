@@ -2,5 +2,5 @@
 https://karime-rank.vercel.app/
 
 ## Dev Notes
-Make sure to use node 2
-`nvm use 22`
+Make sure to use node 24
+`nvm use 24`
